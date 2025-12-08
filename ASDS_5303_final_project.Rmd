@@ -1,0 +1,649 @@
+---
+title: "Group 5 5303 Major Project"
+author: "GRoup 5"
+date: "2025-11-21"
+output: word_document
+---
+
+```{r setup, include=TRUE,warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(MASS)      # lda, qda
+library(nnet)      # multinom
+library(caret)     # confusionMatrix
+library(conflicted)
+library(RColorBrewer)
+library(scales)
+library(fmsb)
+
+# Resolve conflicts (MASS masks dplyr)
+conflict_prefer("select",  "dplyr")
+conflict_prefer("filter",  "dplyr")
+conflict_prefer("lag",     "dplyr")
+conflict_prefer("mutate",  "dplyr")
+conflict_prefer("summarise","dplyr")
+
+set.seed(123)
+options(stringsAsFactors = FALSE)
+
+# Helper function for heatmap
+plot_cm_heatmap <- function(cm, title_text) {
+  df <- as.data.frame(cm)
+  names(df) <- c("Actual", "Predicted", "Freq")
+  
+  ggplot(df,
+         aes(x = Predicted, y = Actual, fill = Freq)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Freq), size = 3) +
+    scale_fill_gradient(low = "#E5F5F9", high = "#08589E") +
+    labs(title = title_text, x = "Predicted", y = "Actual") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 30, hjust = 1)
+    )
+}
+
+# Helper function for Macro F1
+macro_f1_from_cm <- function(cm) {
+  cm <- as.matrix(cm)
+  k  <- nrow(cm)
+  f1_vec <- numeric(k)
+  for (i in seq_len(k)) {
+    tp <- cm[i, i]
+    fp <- sum(cm[-i, i])
+    fn <- sum(cm[i, -i])
+    prec <- ifelse(tp + fp == 0, 0, tp / (tp + fp))
+    rec  <- ifelse(tp + fn == 0, 0, tp / (tp + fn))
+    f1   <- ifelse(prec + rec == 0, 0, 2 * prec * rec / (prec + rec))
+    f1_vec[i] <- f1
+  }
+  mean(f1_vec)
+}
+# === Master performance table from confusion matrix ===
+perf_table_from_cm <- function(cm) {
+  cm <- as.matrix(cm)
+  classes <- rownames(cm)
+  total <- sum(cm)
+  
+  df <- data.frame(
+    Class       = classes,
+    TP          = NA_integer_,
+    FN          = NA_integer_,
+    FP          = NA_integer_,
+    TN          = NA_integer_,
+    Sensitivity = NA_real_,   # Recall
+    Specificity = NA_real_,
+    Precision   = NA_real_,
+    Recall      = NA_real_,
+    F1          = NA_real_,
+    Accuracy    = NA_real_    # left NA for per-class; filled for macro row
+  )
+  
+  for (k in classes) {
+    TP <- cm[k, k]
+    FN <- sum(cm[k, ]) - TP
+    FP <- sum(cm[, k]) - TP
+    TN <- total - TP - FN - FP
+    
+    sens <- ifelse(TP + FN == 0, NA, TP / (TP + FN))
+    spec <- ifelse(TN + FP == 0, NA, TN / (TN + FP))
+    prec <- ifelse(TP + FP == 0, NA, TP / (TP + FP))
+    rec  <- sens
+    f1   <- ifelse(is.na(prec) | is.na(rec) | (prec + rec == 0),
+                   NA,
+                   2 * prec * rec / (prec + rec))
+    
+    df[df$Class == k, c("TP","FN","FP","TN")] <- c(TP, FN, FP, TN)
+    df[df$Class == k, "Sensitivity"]          <- sens
+    df[df$Class == k, "Specificity"]          <- spec
+    df[df$Class == k, "Precision"]            <- prec
+    df[df$Class == k, "Recall"]               <- rec
+    df[df$Class == k, "F1"]                   <- f1
+  }
+  
+  # Macro-averages + overall accuracy
+  macro_row <- data.frame(
+    Class       = "Macro Average",
+    TP          = NA,
+    FN          = NA,
+    FP          = NA,
+    TN          = NA,
+    Sensitivity = mean(df$Sensitivity, na.rm = TRUE),
+    Specificity = mean(df$Specificity, na.rm = TRUE),
+    Precision   = mean(df$Precision,   na.rm = TRUE),
+    Recall      = mean(df$Recall,      na.rm = TRUE),
+    F1          = mean(df$F1,          na.rm = TRUE),
+    Accuracy    = sum(diag(cm)) / total
+  )
+  
+  rbind(df, macro_row)
+}
+
+```
+  
+#Data Import  
+```{r}
+hcv_raw <- read.csv("hcvdat0.csv")
+hcv <- as.data.frame(hcv_raw)
+
+dim(hcv)
+str(hcv)
+```
+  
+## Cleaning extra imported columns  
+```{r}
+
+junk_pattern <- "(?i)^\\.\\.\\.|^X$|Unnamed"
+
+hcv <- hcv %>% select(-matches(junk_pattern))
+names(hcv)
+```
+  
+## Feature Engineering  
+```{r}
+bio_cols <- c("ALB","ALP","ALT","AST","BIL",
+              "CHE","CHOL","CREA","GGT","PROT")
+
+hcv <- hcv %>%
+  mutate(
+    Category_raw = Category,
+    Target_ID    = sub("=.*", "", Category_raw),
+    Target_ID    = trimws(Target_ID),
+    Target_Name  = trimws(sub(".*=", "", Category_raw)),
+    Target_ID    = factor(Target_ID,
+                          levels = c("0", "0s", "1", "2", "3"),
+                          labels = c("BloodDonor",
+                                     "SuspectedDonor",
+                                     "Hepatitis",
+                                     "Fibrosis",
+                                     "Cirrhosis")),
+    Sex = trimws(Sex),
+    Sex_Encoded = ifelse(Sex == "m", 1, 0)
+  )
+```
+  
+## Numeric COnversion  
+```{r}
+for (col in bio_cols) {
+  if (col %in% names(hcv)) {
+    suppressWarnings({
+      hcv[[col]] <- as.numeric(trimws(hcv[[col]]))
+    })
+  }
+}
+
+sapply(hcv[bio_cols], function(x) sum(is.na(x)))
+```
+  
+## Missingness & Complete Dataset  
+```{r}
+hcv <- hcv %>%
+  mutate(
+    Missing = ifelse(complete.cases(across(all_of(
+      c(bio_cols, "Age", "Sex_Encoded", "Target_ID")
+    ))), 0, 1)
+  )
+
+hcv_complete <- hcv %>% filter(Missing == 0)
+table(hcv$Missing)
+```
+  
+## Outlier Capping (99%)  
+```{r}
+feature_cols <- bio_cols[bio_cols %in% names(hcv_complete)]
+
+caps <- sapply(feature_cols, function(col) {
+  quantile(hcv_complete[[col]], 0.99, na.rm = TRUE)
+})
+
+for (col in feature_cols) {
+  cap_val <- caps[col]
+  hcv_complete[[col]][hcv_complete[[col]] > cap_val] <- cap_val
+}
+
+caps
+```
+  
+## Standardization  
+```{r}
+bio_matrix <- as.matrix(hcv_complete[, feature_cols])
+bio_scaled <- scale(bio_matrix)
+
+scale_means <- attr(bio_scaled, "scaled:center")
+scale_sds   <- attr(bio_scaled, "scaled:scale")
+
+scaled_features <- as.data.frame(bio_scaled)
+colnames(scaled_features) <- paste0(feature_cols, "_scaled")
+```
+  
+## Final Modelling Dataset  
+```{r}
+final_df <- hcv_complete %>%
+  dplyr::select(Age, Sex_Encoded, Target_ID, Target_Name) %>%
+  dplyr::bind_cols(scaled_features)
+
+str(final_df)
+head(final_df)
+```
+  
+## Merging SuspectedDonor into BloodDonor  
+```{r}
+# Merge on modeling factor
+final_df$Target_ID <- as.character(final_df$Target_ID)
+final_df$Target_ID[final_df$Target_ID == "SuspectedDonor"] <- "BloodDonor"
+final_df$Target_ID <- factor(final_df$Target_ID,
+                             levels = c("BloodDonor", "Hepatitis", "Fibrosis", "Cirrhosis"))
+
+# Merge on label used for plots
+final_df$Target_Name <- as.character(final_df$Target_Name)
+final_df$Target_Name[final_df$Target_Name == "Suspected Donor"] <- "Blood Donor"
+final_df$Target_Name <- factor(final_df$Target_Name,
+                               levels = c("Blood Donor", "Hepatitis", "Fibrosis", "Cirrhosis"))
+
+# Check new counts
+table(final_df$Target_ID)
+
+# Also merging the categories in hcv_complete for consistency
+hcv_complete$Target_ID <- as.character(hcv_complete$Target_ID)
+hcv_complete$Target_ID[hcv_complete$Target_ID == "SuspectedDonor"] <- "BloodDonor"
+hcv_complete$Target_ID <- factor(hcv_complete$Target_ID,
+                                levels = c("BloodDonor","Hepatitis","Fibrosis","Cirrhosis"))
+
+hcv_complete$Target_Name <- as.character(hcv_complete$Target_Name)
+hcv_complete$Target_Name[hcv_complete$Target_Name == "Suspected Donor"] <- "Blood Donor"
+hcv_complete$Target_Name <- factor(hcv_complete$Target_Name,
+                                   levels = c("Blood Donor", "Hepatitis", "Fibrosis", "Cirrhosis"))
+```
+## Colour Palletes  
+```{r}
+category_palette <- c(
+  "Blood Donor" = "#1B9E77",  # healthy / safe (green)
+  "Hepatitis"   = "#D95F02",  # inflammation (orange)
+  "Fibrosis"    = "#7570B3",  # chronic scarring (purple)
+  "Cirrhosis"   = "#D73027"   # advanced damage (red)
+)
+```
+  
+## EDA  
+```{r}
+# Biomarker distributions across liver disease groups
+biomarker_long <- final_df %>%
+  pivot_longer(cols = ends_with("_scaled"),
+               names_to = "Biomarker",
+               values_to = "Value")
+
+ggplot(biomarker_long,
+       aes(x = Target_Name,
+           y = Value,
+           fill = Target_Name)) +
+  geom_boxplot(alpha = 0.85) +
+  scale_fill_manual(values = category_palette) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        legend.position = "none") +
+  labs(title = "Biomarker Levels by Disease Category",
+       x = "Category", y = "Standardized Value")
+```
+#The “NA” group represents patients whose diagnosis label was not recorded in the original dataset. These cases are not biomarker missing values but undiagnosed entries.'
+
+```{r}
+# Correlation heatmap of the biomarkers
+corr_mat <- cor(final_df %>% select(ends_with("_scaled")))
+
+corr_df <- as.data.frame(as.table(corr_mat))
+names(corr_df) <- c("Var1", "Var2", "Correlation")
+
+ggplot(corr_df, aes(Var1, Var2, fill = Correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "#313695", mid = "white", high = "#A50026",
+                       midpoint = 0) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Correlation Among Biochemical Markers",
+       x = "", y = "")
+```
+  
+
+```{r}
+# Mean biomarker trend from healthy to severe disease
+# Define medically-ordered severity
+severity_order <- c("Blood Donor", "Hepatitis", "Fibrosis", "Cirrhosis")
+
+biomarker_long$Target_Name <- factor(biomarker_long$Target_Name,
+                                     levels = severity_order)
+
+mean_biomarkers <- biomarker_long %>%
+  group_by(Target_Name, Biomarker) %>%
+  summarise(MeanValue = mean(Value), .groups = "drop")
+
+ggplot(mean_biomarkers,
+       aes(x = Biomarker, y = MeanValue, fill = Target_Name)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = category_palette) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Mean Biomarker Levels Across Disease Severity",
+       y = "Mean (Standardized)")
+```
+  
+```{r}
+# ANOVA tests for each biomarker
+anova_results <- lapply(feature_cols, function(col){
+  model <- aov(final_df[[paste0(col, "_scaled")]] ~ final_df$Target_Name)
+  out <- summary(model)
+  data.frame(Biomarker = col,
+             p_value = out[[1]][["Pr(>F)"]][1])
+}) %>% bind_rows()%>% arrange(p_value) 
+
+anova_results
+```
+#We do Anova to check which biomaker impact more
+```{r}
+# Effect Size for biomarkers
+eta_sq_results <- lapply(feature_cols, function(col){
+  model <- aov(final_df[[paste0(col, "_scaled")]] ~ final_df$Target_Name)
+  ss_total <- sum(model$residuals^2) + 
+    sum((fitted(model) - mean(final_df[[paste0(col, "_scaled")]]))^2)
+  ss_between <- sum((tapply(final_df[[paste0(col, "_scaled")]],
+                            final_df$Target_Name, mean) -
+                      mean(final_df[[paste0(col, "_scaled")]]))^2 *
+                      table(final_df$Target_Name))
+  eta_sq <- ss_between / ss_total
+  data.frame(Biomarker = col, EtaSquared = eta_sq)
+}) %>% bind_rows()
+
+eta_sq_results %>%
+  arrange(desc(EtaSquared))
+```
+  
+## Train-Test Split  (80, 20)
+```{r}
+# Define predictor columns
+biomarker_scaled_cols <- grep("_scaled$", names(final_df), value = TRUE)
+predictor_cols <- c("Age", "Sex_Encoded", biomarker_scaled_cols)
+predictor_cols
+
+# Train-test split
+set.seed(123)
+n_total  <- nrow(final_df)
+idx_train <- sample(seq_len(n_total), size = 0.8 * n_total)
+
+train <- final_df[idx_train, ]
+test  <- final_df[-idx_train, ]
+
+# Reference class
+train$Target_ID <- relevel(train$Target_ID, ref = "BloodDonor")
+test$Target_ID  <- relevel(test$Target_ID,  ref = "BloodDonor")
+
+table(train$Target_ID)
+table(test$Target_ID)
+
+# oversample minority classes in train only
+balance_target <- 70   # desired minimum per minority class
+
+train <- train %>%
+  group_by(Target_ID) %>%
+  do({
+    if (nrow(.) < balance_target) {
+      oversample_n <- balance_target - nrow(.)
+      rbind(., .[sample(1:nrow(.), oversample_n, replace = TRUE), ])
+    } else {
+      .
+    }
+  }) %>%
+  ungroup()
+
+table(train$Target_ID)
+```
+  
+## Multinomial Logistic Regression  
+```{r}
+## Multinomial Logistic Regression  
+multi_formula <- as.formula(
+  paste("Target_ID ~", paste(predictor_cols, collapse = " + "))
+)
+
+model_multi <- multinom(multi_formula, data = train, maxit = 200, trace = FALSE)
+
+pred_multi <- predict(model_multi, newdata = test)
+
+cm_multi <- table(
+  Actual    = test$Target_ID,
+  Predicted = pred_multi
+)
+cm_multi
+
+multi_acc <- sum(diag(cm_multi)) / sum(cm_multi)
+multi_f1  <- macro_f1_from_cm(cm_multi)
+
+cat("Accuracy:", multi_acc, "\n")
+cat("F1 score:", multi_f1, "\n")
+
+plot_cm_heatmap(cm_multi, "Multinomial Logistic Regression: Confusion Matrix")
+
+#Full diagnostic table for Multinomial
+multi_perf <- perf_table_from_cm(cm_multi)
+multi_perf
+```
+  
+## LDA on full feature space  
+```{r}
+lda_formula <- multi_formula  # same predictors as multinomial
+
+lda_fit <- lda(lda_formula, data = train)
+
+lda_pred  <- predict(lda_fit, newdata = test)
+lda_class <- lda_pred$class
+
+cm_lda <- table(
+  Actual    = test$Target_ID,
+  Predicted = lda_class
+)
+cm_lda
+
+lda_acc <- sum(diag(cm_lda)) / sum(cm_lda)
+lda_f1  <- macro_f1_from_cm(cm_lda)
+cat("Accuracy:", lda_acc, "\n")
+cat("F1 score:", lda_f1, "\n")
+
+plot_cm_heatmap(cm_lda, "LDA: Confusion Matrix")
+# Full diagnostic table for LDA
+lda_perf <- perf_table_from_cm(cm_lda)
+lda_perf
+```
+  
+## PCA  
+```{r}
+# PCA fit on training only to avoid leakage
+train_pca_X <- train[, biomarker_scaled_cols]
+test_pca_X  <- test[,  biomarker_scaled_cols]
+
+pca_model <- prcomp(train_pca_X, center = TRUE, scale. = TRUE)
+
+# Project both train & test into PCA space
+train_pca_scores <- as.data.frame(predict(pca_model, newdata = train_pca_X))
+test_pca_scores  <- as.data.frame(predict(pca_model, newdata = test_pca_X))
+
+# Keep only PC1–PC3
+train_qda <- train_pca_scores[, c("PC1","PC2","PC3")]
+test_qda  <- test_pca_scores[,  c("PC1","PC2","PC3")]
+
+train_qda$Target_ID <- train$Target_ID
+test_qda$Target_ID  <- test$Target_ID
+```
+  
+## Variance Explained by PCA  
+```{r}
+# Extract variance explained
+pca_var   <- pca_model$sdev^2
+pca_prop  <- pca_var / sum(pca_var)
+pca_cum   <- cumsum(pca_prop)
+
+# Data frame for table & plot
+pca_var_df <- data.frame(
+  PC            = paste0("PC", seq_along(pca_prop)),
+  Variance      = pca_prop,
+  CumulativeVar = pca_cum
+)
+
+# Fix ordering
+pca_var_df$PC <- factor(pca_var_df$PC,
+                        levels = paste0("PC", seq_along(pca_prop)),
+                        ordered = TRUE)
+
+# Scree plot to visualize the variance explained
+ggplot(pca_var_df, aes(x = PC, y = Variance, group = 1)) +
+  geom_col(fill = "#2E86AB") +
+  geom_line(color = "#1B4F72", linewidth = 0.8) +
+  geom_point(color = "#1B4F72", size = 2) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Scree Plot: Variance Explained by Principal Components",
+       x = "Principal Component",
+       y = "Variance Explained (%)")
+```
+  
+```{r}
+# Cummulative variance plot
+ggplot(pca_var_df, aes(x = PC, y = CumulativeVar, group = 1)) +
+  geom_line(color = "#1B4F72", linewidth = 1) +
+  geom_point(color = "#1B4F72", size = 2) +
+  geom_hline(yintercept = 0.90, linetype = "dashed", color = "red") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Cumulative Variance Explained by PCA Components",
+       x = "Principal Component",
+       y = "Cumulative Variance (%)")
+```
+## QDA on PCA Components  
+```{r}
+# Select top 7 PCs (they capture ~95% variance)
+train_qda <- train_pca_scores[, paste0("PC", 1:7)]
+test_qda  <- test_pca_scores[,  paste0("PC", 1:7)]
+
+train_qda$Target_ID <- train$Target_ID
+test_qda$Target_ID  <- test$Target_ID
+
+qda_fit <- qda(Target_ID ~ ., data = train_qda)
+
+qda_pred  <- predict(qda_fit, newdata = test_qda)
+qda_class <- qda_pred$class
+
+qda_cm <- table(
+  Actual    = test_qda$Target_ID,
+  Predicted = qda_class
+)
+
+qda_cm
+
+qda_acc <- sum(diag(qda_cm)) / sum(qda_cm)
+qda_f1  <- macro_f1_from_cm(qda_cm)
+
+cat("Accuracy:", qda_acc, "\n")
+cat("F1 score:", qda_f1, "\n")
+
+plot_cm_heatmap(qda_cm, "QDA (PC1–PC7): Confusion Matrix")
+#Full diagnostic table for QDA (PC1–PC7)
+qda_perf <- perf_table_from_cm(qda_cm)
+qda_perf
+```
+LDA on PCA components (PC1–PC7)
+```{r}
+## LDA on PCA Components (PC1–PC7)
+train_lda_pca <- train_pca_scores[, paste0("PC", 1:7)]
+test_lda_pca  <- test_pca_scores[,  paste0("PC", 1:7)]
+
+train_lda_pca$Target_ID <- train$Target_ID
+test_lda_pca$Target_ID  <- test$Target_ID
+
+lda_pca_fit <- lda(Target_ID ~ ., data = train_lda_pca)
+
+lda_pca_pred  <- predict(lda_pca_fit, newdata = test_lda_pca)
+lda_pca_class <- lda_pca_pred$class
+
+cm_lda_pca <- table(
+  Actual    = test_lda_pca$Target_ID,
+  Predicted = lda_pca_class
+)
+cm_lda_pca
+
+lda_pca_acc <- sum(diag(cm_lda_pca)) / sum(cm_lda_pca)
+lda_pca_f1  <- macro_f1_from_cm(cm_lda_pca)
+
+cat("Accuracy (LDA PC1–PC7):", lda_pca_acc, "\n")
+cat("F1 score (LDA PC1–PC7):", lda_pca_f1, "\n")
+
+plot_cm_heatmap(cm_lda_pca, "LDA (PC1–PC7): Confusion Matrix")
+
+# === Full diagnostic table for LDA (PC1–PC7) ===
+lda_pca_perf <- perf_table_from_cm(cm_lda_pca)
+lda_pca_perf
+
+```
+#compact model comparison table
+```{r}
+model_summary <- data.frame(
+  Model   = c(
+    "Multinomial Logistic Regression",
+    "LDA",
+    "LDA (PC1–PC7)",
+    "QDA (PC1–PC7)"
+  ),
+  
+  Accuracy = c(
+    multi_perf$Accuracy[multi_perf$Class == "Macro Average"],
+    lda_perf$Accuracy[lda_perf$Class == "Macro Average"],
+    lda_pca_perf$Accuracy[lda_pca_perf$Class == "Macro Average"],
+    qda_perf$Accuracy[qda_perf$Class == "Macro Average"]
+  ),
+  
+  Macro_Sensitivity = c(
+    multi_perf$Sensitivity[multi_perf$Class == "Macro Average"],
+    lda_perf$Sensitivity[lda_perf$Class == "Macro Average"],
+    lda_pca_perf$Sensitivity[lda_pca_perf$Class == "Macro Average"],
+    qda_perf$Sensitivity[qda_perf$Class == "Macro Average"]
+  ),
+  
+  Macro_Specificity = c(
+    multi_perf$Specificity[multi_perf$Class == "Macro Average"],
+    lda_perf$Specificity[lda_perf$Class == "Macro Average"],
+    lda_pca_perf$Specificity[lda_pca_perf$Class == "Macro Average"],
+    qda_perf$Specificity[qda_perf$Class == "Macro Average"]
+  ),
+  
+  Macro_Precision = c(
+    multi_perf$Precision[multi_perf$Class == "Macro Average"],
+    lda_perf$Precision[lda_perf$Class == "Macro Average"],
+    lda_pca_perf$Precision[lda_pca_perf$Class == "Macro Average"],
+    qda_perf$Precision[qda_perf$Class == "Macro Average"]
+  ),
+  
+  Macro_Recall = c(
+    multi_perf$Recall[multi_perf$Class == "Macro Average"],
+    lda_perf$Recall[lda_perf$Class == "Macro Average"],
+    lda_pca_perf$Recall[lda_pca_perf$Class == "Macro Average"],
+    qda_perf$Recall[qda_perf$Class == "Macro Average"]
+  ),
+  
+  Macro_F1 = c(
+    multi_perf$F1[multi_perf$Class == "Macro Average"],
+    lda_perf$F1[lda_perf$Class == "Macro Average"],
+    lda_pca_perf$F1[lda_pca_perf$Class == "Macro Average"],
+    qda_perf$F1[qda_perf$Class == "Macro Average"]
+  ),
+  
+  row.names = NULL
+)
+
+model_summary
+
+
+```
